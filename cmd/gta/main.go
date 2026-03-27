@@ -21,7 +21,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/digitalocean/gta"
+	"github.com/bastionplatforms/gta"
 	"golang.org/x/term"
 )
 

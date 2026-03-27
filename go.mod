@@ -1,4 +1,4 @@
-module github.com/digitalocean/gta
+module github.com/bastionplatforms/gta
 
 go 1.25
 
