@@ -96,6 +96,8 @@ type GTA struct {
 	roots                     []string
 	includeTransitiveTestDeps bool
 	disableWorkspace          bool
+	baseGoMod                 string
+	baseGoSum                 string
 }
 
 // New returns a new GTA with various options passed to New. Options will be
@@ -199,7 +201,9 @@ func (g *GTA) ChangedPackages() (*Packages, error) {
 			if check {
 				pkg2, err := packageFromImport(path)
 				if err != nil {
-					return nil, err
+					// Package cannot be resolved -- likely an external
+					// dependency not in the local module. Skip it.
+					continue
 				}
 				pkg = pkg2
 			}
@@ -261,19 +265,24 @@ func (g *GTA) markedPackages() (map[string]map[string]bool, error) {
 	onlyTestsAffected := make(map[string]struct{})
 	onlyTestPackagesChanged := make(map[string]struct{})
 	for abs, dir := range dirs {
-		// TODO(bc): handle changes to go.mod when vendoring is not being used.
-
-		// When go.work or go.mod changes, the dependency graph may have changed
-		// significantly. Mark all resolvable packages that match our prefix
-		// filter as changed so their dependents will be re-evaluated.
-		hasModuleConfig := false
+		// Detect changes to module configuration files.
+		hasGoWork := false
+		hasGoMod := false
+		hasGoSum := false
 		for _, f := range dir.Files {
-			if f == "go.work" || f == "go.mod" {
-				hasModuleConfig = true
-				break
+			switch f {
+			case "go.work":
+				hasGoWork = true
+			case "go.mod":
+				hasGoMod = true
+			case "go.sum":
+				hasGoSum = true
 			}
 		}
-		if hasModuleConfig {
+
+		// go.work changes always use the nuclear option -- workspace structural
+		// changes warrant full re-evaluation.
+		if hasGoWork {
 			graph, err := g.packager.DependentGraph()
 			if err == nil {
 				for pkg := range graph.graph {
@@ -285,8 +294,87 @@ func (g *GTA) markedPackages() (map[string]map[string]bool, error) {
 					}
 				}
 			}
-			// If this directory has no Go files (e.g. workspace root with
-			// only go.work), skip further package-level processing.
+			if !hasGoFile(dir.Files) {
+				continue
+			}
+		}
+
+		// For go.mod/go.sum changes, attempt precise dependency diff analysis.
+		if hasGoMod || hasGoSum {
+			var changedModPaths []string
+			preciseDetection := false
+
+			// Strategy 1: Use BaseFileReader (git differ) to get old content
+			if baseReader, ok := g.differ.(BaseFileReader); ok {
+				if hasGoMod {
+					relPath := relativeModFilePath(abs, g.roots, "go.mod")
+					oldData, err := baseReader.ReadBaseFile(relPath)
+					if err == nil && oldData != nil {
+						newData, _ := os.ReadFile(filepath.Join(abs, "go.mod"))
+						if changes, err := diffGoMod(oldData, newData); err == nil {
+							for _, mc := range changes {
+								changedModPaths = append(changedModPaths, mc.Path)
+							}
+							preciseDetection = true
+						}
+					}
+				}
+				if hasGoSum {
+					relPath := relativeModFilePath(abs, g.roots, "go.sum")
+					oldData, err := baseReader.ReadBaseFile(relPath)
+					if err == nil && oldData != nil {
+						newData, _ := os.ReadFile(filepath.Join(abs, "go.sum"))
+						sumPaths := diffGoSum(oldData, newData)
+						changedModPaths = append(changedModPaths, sumPaths...)
+						preciseDetection = true
+					}
+				}
+			}
+
+			// Strategy 2: Use provided base files (file-differ mode)
+			if !preciseDetection && (g.baseGoMod != "" || g.baseGoSum != "") {
+				if g.baseGoMod != "" && hasGoMod {
+					oldData, _ := os.ReadFile(g.baseGoMod)
+					newData, _ := os.ReadFile(filepath.Join(abs, "go.mod"))
+					if changes, err := diffGoMod(oldData, newData); err == nil {
+						for _, mc := range changes {
+							changedModPaths = append(changedModPaths, mc.Path)
+						}
+						preciseDetection = true
+					}
+				}
+				if g.baseGoSum != "" && hasGoSum {
+					oldData, _ := os.ReadFile(g.baseGoSum)
+					newData, _ := os.ReadFile(filepath.Join(abs, "go.sum"))
+					sumPaths := diffGoSum(oldData, newData)
+					changedModPaths = append(changedModPaths, sumPaths...)
+					preciseDetection = true
+				}
+			}
+
+			// Apply results
+			if preciseDetection && len(changedModPaths) > 0 {
+				changedModPaths = dedup(changedModPaths)
+				if finder, ok := g.packager.(localImporterFinder); ok {
+					for _, importerPath := range finder.LocalImportersOf(changedModPaths) {
+						changed[importerPath] = false
+					}
+				}
+			} else if !preciseDetection {
+				// Fallback: no base available -- use nuclear option (existing behavior)
+				graph, err := g.packager.DependentGraph()
+				if err == nil {
+					for pkg := range graph.graph {
+						if !hasPrefixIn(pkg, g.prefixes) {
+							continue
+						}
+						if _, err := g.packager.PackageFromImport(pkg); err == nil {
+							changed[pkg] = false
+						}
+					}
+				}
+			}
+
 			if !hasGoFile(dir.Files) {
 				continue
 			}
@@ -441,6 +529,7 @@ func (g *GTA) markedPackages() (map[string]map[string]bool, error) {
 		// Traverse dependents. When includeTransitiveTestDeps is true, test-only
 		// edges are traversed the same as production edges (replicating the old
 		// behavior where all imports were in a single reverse graph).
+		checker, hasChecker := g.packager.(localPackageChecker)
 		var traverse func(node string)
 		traverse = func(node string) {
 			if marked[node] {
@@ -450,12 +539,19 @@ func (g *GTA) markedPackages() (map[string]map[string]bool, error) {
 
 			if edges, ok := graph.graph[node]; ok {
 				for edge := range edges {
+					// Skip non-local dependents if the packager supports the check
+					if hasChecker && !checker.isLocalPackage(edge) {
+						continue
+					}
 					traverse(edge)
 				}
 			}
 			if g.includeTransitiveTestDeps {
 				if edges, ok := testOnlyGraph.graph[node]; ok {
 					for edge := range edges {
+						if hasChecker && !checker.isLocalPackage(edge) {
+							continue
+						}
 						traverse(edge)
 					}
 				}
@@ -483,6 +579,47 @@ func (g *GTA) markedPackages() (map[string]map[string]bool, error) {
 	}
 
 	return paths, nil
+}
+
+// localPackageChecker is satisfied by packageContext but not required
+// by custom Packager implementations.
+type localPackageChecker interface {
+	isLocalPackage(string) bool
+}
+
+// localImporterFinder is satisfied by packageContext but not required
+// by custom Packager implementations.
+type localImporterFinder interface {
+	LocalImportersOf(modulePaths []string) []string
+}
+
+// dedup removes duplicate strings from a slice.
+func dedup(sl []string) []string {
+	seen := make(map[string]struct{}, len(sl))
+	result := make([]string, 0, len(sl))
+	for _, s := range sl {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		result = append(result, s)
+	}
+	return result
+}
+
+// relativeModFilePath computes the git-relative path to a module file
+// (go.mod or go.sum) given the absolute directory and the repository roots.
+func relativeModFilePath(absDir string, roots []string, filename string) string {
+	for _, root := range roots {
+		if strings.HasPrefix(absDir, root) {
+			rel, err := filepath.Rel(root, absDir)
+			if err == nil {
+				return filepath.Join(rel, filename)
+			}
+		}
+	}
+	// Fallback: just use the filename
+	return filename
 }
 
 var errImportPathNotFound = errors.New("could not find import path")
