@@ -227,13 +227,15 @@ func (g *git) diff() (map[string]struct{}, error) {
 			for _, parent2 := range rightwardParents {
 				// get the names of all affected files without doing rename detection.
 				cmd := exec.Command("git", "diff", fmt.Sprintf("%s...%s", parent1, parent2), "--name-only", "--no-renames")
+				var cmdStderr strings.Builder
+				cmd.Stderr = &cmdStderr
 				stdout, err := cmd.StdoutPipe()
 				if err != nil {
 					return nil, err
 				}
 
 				if err := cmd.Start(); err != nil {
-					return nil, err
+					return nil, gitCmdError(cmd, cmdStderr.String(), err)
 				}
 
 				changedPaths, err := diffPaths(root, stdout)
@@ -247,7 +249,7 @@ func (g *git) diff() (map[string]struct{}, error) {
 
 				err = cmd.Wait()
 				if err != nil {
-					return nil, err
+					return nil, gitCmdError(cmd, cmdStderr.String(), err)
 				}
 			}
 			return files, nil
@@ -350,12 +352,23 @@ func (g *git) readBaseFile(absPath string) ([]byte, error) {
 	return out, nil
 }
 
+// gitCmdError wraps err with the full command line and git's full stderr so a
+// failed git invocation surfaces the exact command and git's complete
+// diagnostic output to the caller. The underlying err is preserved via %w.
+func gitCmdError(c *exec.Cmd, stderr string, err error) error {
+	stderr = strings.TrimRight(stderr, "\n")
+	if stderr == "" {
+		return fmt.Errorf("git command failed: %s: %w", c.String(), err)
+	}
+	return fmt.Errorf("git command failed: %s: %w\ngit stderr:\n%s", c.String(), err, stderr)
+}
+
 func execWithStderr(c *exec.Cmd) (out []byte, err error) {
 	var stderr strings.Builder
 	c.Stderr = &stderr
 	out, err = c.Output()
 	if err != nil {
-		err = fmt.Errorf("%w: %s", err, stderr.String())
+		err = gitCmdError(c, stderr.String(), err)
 	}
 	return
 }
